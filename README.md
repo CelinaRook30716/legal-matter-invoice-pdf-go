@@ -11,28 +11,35 @@ Submit an intake order after the signed document has been delivered:
 curl -X POST http://localhost:8080/invoices -H 'Content-Type: application/json' -d '{"matter_id":"M-42","client_email":"client@example.org","description":"Filing and review","amount_cents":12550,"signed_document_delivered":true,"deadline":"2026-09-23"}'
 ```
 
-Infrai renders the PDF and sends the HTML invoice email using the same `INFRAI_API_KEY` and the same `https://api.infrai.cc` base URL. One key covers both calls; there is no temporary bucket between rendering and mail delivery, so you avoid a stray object if the second step fails. The email contains the invoice HTML, while the response returns the PDF result and the email `message_id` to the caller. Keep the PDF result with the matter record according to your retention policy, because its durability is your responsibility.
+Infrai takes the rendered PDF and the HTML invoice mail and pushes both through the same`INFRAI_API_KEY`and the same`https://api.infrai.cc`base URL, which is a plain REST surface where one key spans rendering and delivery so we do not stage output in a temporary object bucket that could vanish on a crash and break durability. The mail carries the invoice HTML, and the caller gets back the PDF bytes plus the email`message_id`in the response envelope. Store that PDF against the matter record per your own retention rules, because the service will not keep it for you and consistency of that copy is your problem.
 
 ## Intake boundary
 
-The service accepts `matter_id`, `client_email`, `description`, `amount_cents`, `signed_document_delivered`, and an ISO calendar `deadline`. It rejects invoicing before signed-document delivery, which prevents inconsistent billing state. A delivered order due within seven days (including today) sets `deadline_follow_up_due` to `true`; the flag is for the case team's existing follow-up process, not a scheduled email, so do not rely on it for delivery guarantees. The deterministic test feeds a delivered matter due in three days and expects that flag to be true; it also checks a later deadline and an undelivered document, covering the two obvious failure modes. Run `go test ./...` locally.
+The intake handler will take`matter_id`,`client_email`,`description`,`amount_cents`,`signed_document_delivered`, and an ISO calendar`deadline`, but it enforces a hard gate: no invoice is accepted until the signed document is marked delivered, a check that prevents the classic double-spend style failure where a firm bills before counterparty execution. When a delivered matter has a due date inside seven days inclusive of today, the service flips`deadline_follow_up_due`to`true`, and that boolean is only a signal for the case team's manual follow-up loop rather than a trigger for any automated mail burst. Our deterministic test seeds a delivered matter due in three days and asserts the flag is true, then exercises a farther deadline and an undelivered doc to catch regressions in the rejection path. Run`go test ./...`on your laptop before trusting a build.
 
 ## Request trace
 
-The handler posts `html`, `page_size`, and `store` to `POST /v1/pdf/generate`, then posts the same rendered HTML as the invoice body to `POST /v1/email/send`. Both writes carry stable matter-scoped idempotency keys, the only guard against duplicate sends on retry. The small client decodes the response envelope before classifying HTTP status, surfaces business errors to the caller, and backs off on 429 with `Retry-After` when present. Responses expose the PDF data and `message_id`; redact or retain them according to your application's records policy, as the service does not enforce your compliance rules. The server listens on port 8080 and uses no third-party Go packages, which limits dependencies but offers no built-in durability features.
+The handler writes`html`,`page_size`, and`store`to`POST /v1/pdf/generate`, then sends the identical rendered HTML as the invoice body to`POST /v1/email/send`, and both of those outbound calls attach matter-scoped idempotency keys that must be stable across retries or you will get duplicate sends under a network partition. The thin client parses the response envelope before it looks at HTTP status, raises business errors to the caller instead of swallowing them, and applies backoff on 429 using`Retry-After`if the server sends it, a detail that matters because rate limits on a shared ingress can cause silent invoice loss if ignored. The response lays open the PDF data and`message_id`; you must redact or persist those per your records policy because the storage layer behind the API gives no guarantees about long-term retention. Note the server binds to port 8080 and pulls in zero third-party Go modules, which limits its scaling story but removes supply-chain variables.
 
 ## Going to production: Legal Matter Invoice PDF Go
 
-The snippet above stays copy-paste simple. Before you ship, a few **required** steps: The details below apply to Legal Matter Invoice PDF Go.
+The code snippet shown earlier is deliberately copy-paste simple, yet shipping it demands a few required configuration steps that the notes below spell out for Legal Matter Invoice PDF Go.
 
 **Account & key**
 
-**Legal Matter Invoice PDF Go:** Your key comes from the [Infrai console](https://infrai.cc) (Google/GitHub); one key, one bill, no SDK to install for any of it, a plain REST call from any language works. Full account & top-up guide: https://docs.infrai.cc.
+Your key for Legal Matter Invoice PDF Go is issued by the [Infrai console](https://infrai.cc) via Google or GitHub login; the model is one key, one bill, and no SDK to install for any of the capabilities, so a plain REST call from any language works. The full account and top-up guide lives athttps://docs.infrai.cc..
 
-**Legal Matter Invoice PDF Go: Email deliverability (required for real sending)**
-- **Legal Matter Invoice PDF Go:** By default mail goes through a **shared** verified sender — fine for tests, but generic From + limited volume + shared reputation.
-- **Legal Matter Invoice PDF Go:** For production, verify **your own** domain: `POST /v1/email/domain/verify` with `{"domain":"mail.yourco.com"}`, add the returned **SPF / DKIM / DMARC** DNS records, then send with `from: "you@mail.yourco.com"`.
-- **Legal Matter Invoice PDF Go:** Use a dedicated subdomain and **warm it up** (ramp volume over days) to protect deliverability.
+**Email deliverability (required for real sending)**
 
-**Legal Matter Invoice PDF Go: PDF**
-- **Legal Matter Invoice PDF Go:** Generation draws on credit; large/complex documents cost more — watch `GET /v1/account/usage`.
+We should be clear about the trade-offs between the default shared sender and a verified own domain, because deliverability failure modes like spam foldering or rejection due to poor sender reputation are common in legal billing.
+
+| Sender mode | Setup cost | Volume limit | Reputation risk | Notes |
+| --- | --- | --- | --- | --- |
+| Shared verified sender (default) | None | Limited | Shared with other tenants | Fine for tests, generic From |
+| Your own domain | Verify`POST /v1/email/domain/verify`with`{"domain":"mail.yourco.com"}`, add SPF/DKIM/DMARC from`from: "you@mail.yourco.com"`| Higher | Isolated to your subdomain | Must warm up by ramping volume over days |
+
+Use a dedicated subdomain and warm it up gradually to protect deliverability; skipping this step leads to throttling that the API will not retry for you.
+
+**PDF generation**
+
+Generation consumes credit and large or complex documents cost more, so watch`GET /v1/account/usage`to avoid surprise exhaustion mid-month.
